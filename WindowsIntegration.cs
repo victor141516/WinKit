@@ -102,8 +102,10 @@ internal static class Bootstrap
         Directory.CreateDirectory(Root);
         if (File.Exists(installed))
         {
-            string oldHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(installed)));
-            string newHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(current)));
+            string oldHash;
+            using (var stream = File.OpenRead(installed)) oldHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream));
+            string newHash;
+            using (var stream = File.OpenRead(current)) newHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream));
             if (oldHash != newHash) File.Copy(current, installed, true);
         }
         else File.Copy(current, installed);

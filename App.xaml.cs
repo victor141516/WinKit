@@ -21,6 +21,8 @@ public partial class App : System.Windows.Application
     private MainWindow? _window;
     private bool _exiting;
     private Icon? _icon;
+    private readonly Dictionary<string, Forms.ToolStripMenuItem> _utilityItems = new();
+    private Forms.ToolStripMenuItem? _startupItem;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -68,7 +70,7 @@ public partial class App : System.Windows.Application
                 RefreshTray();
             });
             if (!background) ShowSettings(firstRun);
-            if (!firstRun) _ = Task.Run(_manager.SynchronizeAllAsync);
+            if (!firstRun) _ = RunManagerActionAsync(_manager.SynchronizeAllAsync, showErrors: false);
         }
         catch (Exception ex)
         {
@@ -83,13 +85,9 @@ public partial class App : System.Windows.Application
         _icon = CreateIcon();
         _tray = new Forms.NotifyIcon { Icon = _icon, Text = "WinKit", Visible = true };
         _tray.DoubleClick += (_, _) => ShowSettings();
-        RefreshTray();
-    }
-
-    private void RefreshTray()
-    {
-        if (_tray is null || _manager is null || _exiting) return;
+        if (_manager is null) return;
         var menu = new Forms.ContextMenuStrip { Font = new Font("Segoe UI", 9) };
+        menu.Opening += (_, _) => RefreshTray();
         menu.Items.Add("Open WinKit", null, (_, _) => ShowSettings());
         menu.Items.Add(new Forms.ToolStripSeparator());
         foreach (var app in AppSpec.All)
@@ -101,19 +99,20 @@ public partial class App : System.Windows.Application
                 ToolTipText = status.Message,
                 CheckOnClick = false
             };
+            _utilityItems[app.Id] = item;
             item.Click += async (_, _) =>
             {
                 bool enabled = !_manager.IsEnabled(app);
-                try { await Task.Run(() => _manager.SetEnabledAsync(app, enabled)); }
-                catch (Exception ex) { Log.Error("Toggle " + app.Name, ex); System.Windows.MessageBox.Show(ex.Message, "WinKit", MessageBoxButton.OK, MessageBoxImage.Error); }
+                await RunManagerActionAsync(() => _manager.SetEnabledAsync(app, enabled));
                 _window?.RefreshSelection();
                 RefreshTray();
             };
             menu.Items.Add(item);
         }
         menu.Items.Add(new Forms.ToolStripSeparator());
-        menu.Items.Add("Check for updates", null, async (_, _) => await Task.Run(_manager.SynchronizeAllAsync));
+        menu.Items.Add("Check for updates", null, async (_, _) => await RunManagerActionAsync(_manager.SynchronizeAllAsync));
         var startup = new Forms.ToolStripMenuItem("Start with Windows") { Checked = _manager.StartWithWindows };
+        _startupItem = startup;
         startup.Click += (_, _) =>
         {
             try { _manager.SetStartWithWindows(!_manager.StartWithWindows); _window?.RefreshSelection(); RefreshTray(); }
@@ -121,9 +120,31 @@ public partial class App : System.Windows.Application
         };
         menu.Items.Add(startup);
         menu.Items.Add("Exit WinKit", null, (_, _) => ExitManager());
-        var old = _tray.ContextMenuStrip;
         _tray.ContextMenuStrip = menu;
-        if (old is not null) Dispatcher.BeginInvoke(old.Dispose);
+        RefreshTray();
+    }
+
+    private void RefreshTray()
+    {
+        if (_manager is null || _exiting) return;
+        foreach (var app in AppSpec.All)
+        {
+            if (!_utilityItems.TryGetValue(app.Id, out var item)) continue;
+            item.Checked = _manager.IsEnabled(app);
+            item.ToolTipText = _manager.GetStatus(app).Message;
+        }
+        if (_startupItem is not null) _startupItem.Checked = _manager.StartWithWindows;
+    }
+
+    private async Task RunManagerActionAsync(Func<Task> action, bool showErrors = true)
+    {
+        try { await Task.Run(action); }
+        catch (Exception ex)
+        {
+            Log.Error("Manager action", ex);
+            if (showErrors && !_exiting) System.Windows.MessageBox.Show(ex.Message, "WinKit", MessageBoxButton.OK, MessageBoxImage.Error);
+            else if (!_exiting && _tray is not null) _tray.ShowBalloonTip(5000, "WinKit", ex.Message, Forms.ToolTipIcon.Error);
+        }
     }
 
     private void ShowSettings() => ShowSettings(false);
@@ -149,7 +170,7 @@ public partial class App : System.Windows.Application
         _manager?.Dispose();
         _showRegistration?.Unregister(null);
         _show?.Dispose();
-        if (_tray is not null) { _tray.Visible = false; _tray.Dispose(); }
+        if (_tray is not null) { _tray.Visible = false; _tray.ContextMenuStrip?.Dispose(); _tray.Dispose(); }
         _icon?.Dispose();
         _releases?.Dispose();
         _instance?.Dispose();
