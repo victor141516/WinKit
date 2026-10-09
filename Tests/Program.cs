@@ -5,6 +5,27 @@ using System.Text.Json;
 using WinKit;
 
 if (args.Contains("--background")) { Thread.Sleep(60000); return 0; }
+if (args.FirstOrDefault() == "--verify-live")
+{
+    string liveRoot = args.Length > 1 ? Path.GetFullPath(args[1]) : Path.Combine(Path.GetTempPath(), "WinKitLive-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(liveRoot);
+    using var releases = new GitHubReleases();
+    using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+    foreach (var app in AppSpec.All)
+    {
+        ManagedRelease release = await releases.ResolveAsync(app, timeout.Token);
+        string appDirectory = Path.Combine(liveRoot, app.Id);
+        Directory.CreateDirectory(appDirectory);
+        string archive = Path.Combine(appDirectory, release.Asset.Name);
+        if (File.Exists(archive)) File.Delete(archive);
+        Console.WriteLine($"Downloading {app.Name} {release.Version}: {release.Asset.Name}");
+        await releases.DownloadAsync(release.Asset, archive, new SilentProgress(), timeout.Token);
+        string executable = await PackageExtractor.ExtractAsync(archive, Path.Combine(appDirectory, Guid.NewGuid().ToString("N")), app.Executable, release.Sha256, timeout.Token);
+        Console.WriteLine($"VERIFIED {app.Name} {release.Version} SHA256={release.Sha256} EXE={new FileInfo(executable).Length} bytes");
+    }
+    Console.WriteLine("All three latest GitHub packages downloaded and verified. No applications were started or startup entries changed.");
+    return 0;
+}
 string root = Path.Combine(Path.GetTempPath(), "WinKitTests-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
 Log.Root = root;
@@ -286,3 +307,5 @@ sealed class FakeStartup : IStartupControl
     public void SetManagerEnabled(bool enabled) { }
     public void RemoveUtility(AppSpec app) { lock (Removed) Removed.Add(app.Id); }
 }
+
+sealed class SilentProgress : IProgress<int> { public void Report(int value) { } }
