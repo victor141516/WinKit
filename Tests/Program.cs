@@ -23,7 +23,7 @@ if (args.FirstOrDefault() == "--verify-live")
         string executable = await PackageExtractor.ExtractAsync(archive, Path.Combine(appDirectory, Guid.NewGuid().ToString("N")), app.Executable, release.Sha256, timeout.Token);
         Console.WriteLine($"VERIFIED {app.Name} {release.Version} SHA256={release.Sha256} EXE={new FileInfo(executable).Length} bytes");
     }
-    Console.WriteLine("All three latest GitHub packages downloaded and verified. No applications were started or startup entries changed.");
+    Console.WriteLine($"All {AppSpec.All.Length} latest GitHub packages downloaded and verified. No applications were started or startup entries changed.");
     return 0;
 }
 string root = Path.Combine(Path.GetTempPath(), "WinKitTests-" + Guid.NewGuid().ToString("N"));
@@ -33,7 +33,8 @@ var tests = new List<(string, Func<Task>)>
 {
     ("Latest release and architecture are read from manifest", ReleaseSelection),
     ("Non-portable or unsafe release is rejected", InvalidRelease),
-    ("One, two, and three selections install only selected utilities", Selections),
+    ("Partial and full selections install only selected utilities", Selections),
+    ("Adding a utility preserves existing startup selections", ExistingSelection),
     ("Every startup checks latest release without redundant downloads", RepeatStartup),
     ("New release replaces running app and retains rollback package", Upgrade),
     ("Offline startup launches installed package", Offline),
@@ -91,7 +92,7 @@ async Task InvalidRelease()
 
 async Task Selections()
 {
-    for (int count = 1; count <= 3; count++)
+    for (int count = 1; count <= AppSpec.All.Length; count++)
     {
         using var f = Make();
         await Task.WhenAll(AppSpec.All.Take(count).Select(app => f.Manager.SetEnabledAsync(app, true)));
@@ -99,6 +100,19 @@ async Task Selections()
         Assert(f.Source.Downloads == count, "Unselected app downloaded.");
         Assert(AppSpec.All.Take(count).All(app => f.Store.ReadPackage(app) is not null), "Install missing.");
     }
+}
+
+async Task ExistingSelection()
+{
+    var store = new StateStore(NewRoot());
+    var preferences = new Preferences();
+    foreach (var app in AppSpec.All.Take(3)) preferences.Enabled[app.Id] = true;
+    store.Save(preferences);
+    var source = new FakeSource();
+    using var manager = new Manager(store, source, new FakeProcesses(), new FakeStartup());
+    await manager.SynchronizeAllAsync();
+    Assert(!manager.IsEnabled(AppSpec.All[3]), "The new utility was enabled without a saved selection.");
+    Assert(source.Downloads == 3 && AppSpec.All.Take(3).All(manager.IsEnabled), "Existing selections changed.");
 }
 
 async Task RepeatStartup()

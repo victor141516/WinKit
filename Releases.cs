@@ -21,7 +21,7 @@ internal sealed class GitHubReleases : IReleaseSource, IDisposable
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
     public GitHubReleases()
     {
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("WinKit/0.1");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd("WinKit/0.2");
         _http.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
     }
 

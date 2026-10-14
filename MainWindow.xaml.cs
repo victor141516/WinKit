@@ -14,6 +14,9 @@ public partial class MainWindow : Window
         _manager = manager;
         foreach (var app in AppSpec.All) Rows.Add(new AppRow(app, firstRun || manager.IsEnabled(app), firstRun ? new AppStatus(false, "Ready to install") : manager.GetStatus(app)));
         InitializeComponent();
+        MaxHeight = Math.Max(1, SystemParameters.WorkArea.Height - 32);
+        MinHeight = Math.Min(MinHeight, MaxHeight);
+        Height = Math.Min(340 + Rows.Count * 105, MaxHeight);
         DataContext = new { Rows };
         StartupCheck.IsChecked = manager.StartWithWindows;
     }
