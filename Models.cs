@@ -11,7 +11,8 @@ internal sealed record AppSpec(string Id, string Name, string Description, strin
         new("comienzo", "Comienzo", "A faster Start menu", "https://github.com/victor141516/comienzo", "Comienzo.exe"),
         new("voolime", "Voolime", "Volume controls for each app", "https://github.com/victor141516/voolime", "Voolime.exe"),
         new("trapezoid", "Trapezoid", "Arrange windows with shortcuts", "https://github.com/victor141516/trapezoid", "Trapezoid.exe"),
-        new("captura", "Captura", "Capture and annotate screenshots", "https://github.com/victor141516/Captura", "Captura.exe")
+        new("captura", "Captura", "Capture and annotate screenshots", "https://github.com/victor141516/Captura", "Captura.exe"),
+        new("altabi", "Altabi", "Alt+Tab grouped by app", "https://github.com/victor141516/altabi", "Altabi.exe")
     ];
 }
 
