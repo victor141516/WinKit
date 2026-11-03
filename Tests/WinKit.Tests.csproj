@@ -8,6 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../Models.cs" Link="Models.cs" />
+    <Compile Include="../Catalog.cs" Link="Catalog.cs" />
     <Compile Include="../Releases.cs" Link="Releases.cs" />
     <Compile Include="../Manager.cs" Link="Manager.cs" />
     <Compile Include="../WindowsIntegration.cs" Link="WindowsIntegration.cs" />

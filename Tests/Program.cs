@@ -11,7 +11,9 @@ if (args.FirstOrDefault() == "--verify-live")
     Directory.CreateDirectory(liveRoot);
     using var releases = new GitHubReleases();
     using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(10));
-    foreach (var app in AppSpec.All)
+    var catalog = Catalog.Parse(await releases.FetchCatalogAsync(timeout.Token));
+    Console.WriteLine($"Catalog {Catalog.Location}: {string.Join(", ", catalog.Select(app => app.Name))}");
+    foreach (var app in catalog)
     {
         ManagedRelease release = await releases.ResolveAsync(app, timeout.Token);
         string appDirectory = Path.Combine(liveRoot, app.Id);
@@ -23,12 +25,14 @@ if (args.FirstOrDefault() == "--verify-live")
         string executable = await PackageExtractor.ExtractAsync(archive, Path.Combine(appDirectory, Guid.NewGuid().ToString("N")), app.Executable, release.Sha256, timeout.Token);
         Console.WriteLine($"VERIFIED {app.Name} {release.Version} SHA256={release.Sha256} EXE={new FileInfo(executable).Length} bytes");
     }
-    Console.WriteLine($"All {AppSpec.All.Length} latest GitHub packages downloaded and verified. No applications were started or startup entries changed.");
+    Console.WriteLine($"All {catalog.Count} latest GitHub packages downloaded and verified. No applications were started or startup entries changed.");
     return 0;
 }
 string root = Path.Combine(Path.GetTempPath(), "WinKitTests-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
 Log.Root = root;
+AppSpec[] Apps = new[] { "one", "two", "three", "four", "five" }.Select(id =>
+    new AppSpec(id, char.ToUpperInvariant(id[0]) + id[1..], "Test utility", "https://github.com/example/" + id, char.ToUpperInvariant(id[0]) + id[1..] + ".exe")).ToArray();
 var tests = new List<(string, Func<Task>)>
 {
     ("Latest release and architecture are read from manifest", ReleaseSelection),
@@ -45,7 +49,13 @@ var tests = new List<(string, Func<Task>)>
     ("Disable persists and removes independent startup", Disable),
     ("ZIP traversal, missing EXE, and checksum mismatch are rejected", UnsafeArchives),
     ("Process stop is scoped to installed paths", ScopedProcesses),
-    ("Paths outside managed directory are rejected", InvalidStoredPath)
+    ("Paths outside managed directory are rejected", InvalidStoredPath),
+    ("Invalid catalogs are rejected", InvalidCatalog),
+    ("Catalog refresh adds new utilities and keeps removed enabled ones", CatalogRefresh),
+    ("New utilities are preselected; older settings keep applied ones known", KnownUtilities),
+    ("Checking reports updates and new utilities without downloading", CheckWithoutDownload),
+    ("Offline catalog refresh keeps the cached list", OfflineCatalog),
+    ("Background startup leaves never-offered utilities alone", BackgroundIgnoresNew)
 };
 int failures = 0;
 try
@@ -67,11 +77,11 @@ async Task Reject(Func<Task> action)
     throw new Exception("Expected InvalidDataException.");
 }
 string NewRoot() => Path.Combine(root, Guid.NewGuid().ToString("N"));
-Fixture Make() => new(NewRoot());
+Fixture Make() => new(NewRoot(), Apps);
 
 Task ReleaseSelection()
 {
-    var app = AppSpec.All[0];
+    var app = Apps[0];
     var asset = new ReleaseAsset("custom-name.zip", app.RepositoryUrl + "/releases/download/v99/custom-name.zip", 123);
     var manifest = new ReleaseContract(1, true, true, true, [new("x64", asset.Name, app.Executable, new string('a', 64))]);
     var selected = GitHubReleases.SelectPackage(app, new Release("v99", [asset]), manifest, "x64");
@@ -81,7 +91,7 @@ Task ReleaseSelection()
 
 async Task InvalidRelease()
 {
-    var app = AppSpec.All[0];
+    var app = Apps[0];
     var asset = new ReleaseAsset("portable.zip", app.RepositoryUrl + "/releases/download/v1/portable.zip", 100);
     var valid = new ReleaseContract(1, true, true, true, [new("x64", asset.Name, app.Executable, new string('a', 64))]);
     foreach (var contract in new[] { valid with { Background = false }, valid with { SingleInstance = false }, valid with { SelfContained = false } })
@@ -92,33 +102,34 @@ async Task InvalidRelease()
 
 async Task Selections()
 {
-    for (int count = 1; count <= AppSpec.All.Length; count++)
+    for (int count = 1; count <= Apps.Length; count++)
     {
         using var f = Make();
-        await Task.WhenAll(AppSpec.All.Take(count).Select(app => f.Manager.SetEnabledAsync(app, true)));
+        await Task.WhenAll(Apps.Take(count).Select(app => f.Manager.SetEnabledAsync(app, true)));
         Assert(f.Processes.Starts == count, "Wrong number of started apps.");
         Assert(f.Source.Downloads == count, "Unselected app downloaded.");
-        Assert(AppSpec.All.Take(count).All(app => f.Store.ReadPackage(app) is not null), "Install missing.");
+        Assert(Apps.Take(count).All(app => f.Store.ReadPackage(app) is not null), "Install missing.");
     }
 }
 
 async Task ExistingSelection()
 {
     var store = new StateStore(NewRoot());
+    store.SaveCatalog(Apps);
     var preferences = new Preferences();
-    foreach (var app in AppSpec.All.Take(3)) preferences.Enabled[app.Id] = true;
+    foreach (var app in Apps.Take(3)) preferences.Enabled[app.Id] = true;
     store.Save(preferences);
     var source = new FakeSource();
-    using var manager = new Manager(store, source, new FakeProcesses(), new FakeStartup());
+    using var manager = new Manager(store, source, new FakeCatalog(Apps), new FakeProcesses(), new FakeStartup());
     await manager.SynchronizeAllAsync();
-    Assert(!manager.IsEnabled(AppSpec.All[3]), "The new utility was enabled without a saved selection.");
-    Assert(source.Downloads == 3 && AppSpec.All.Take(3).All(manager.IsEnabled), "Existing selections changed.");
+    Assert(!manager.IsEnabled(Apps[3]), "The new utility was enabled without a saved selection.");
+    Assert(source.Downloads == 3 && Apps.Take(3).All(manager.IsEnabled), "Existing selections changed.");
 }
 
 async Task RepeatStartup()
 {
     using var f = Make();
-    await f.Manager.SetEnabledAsync(AppSpec.All[0], true);
+    await f.Manager.SetEnabledAsync(Apps[0], true);
     await f.Manager.SynchronizeAllAsync();
     Assert(f.Source.Resolutions == 2 && f.Source.Downloads == 1, "Did not check latest release, or downloaded unchanged release again.");
     Assert(f.Processes.Starts == 1, "Duplicate process was started.");
@@ -126,7 +137,7 @@ async Task RepeatStartup()
 
 async Task Upgrade()
 {
-    using var f = Make(); var app = AppSpec.All[0];
+    using var f = Make(); var app = Apps[0];
     await f.Manager.SetEnabledAsync(app, true);
     var old = f.Store.ReadPackage(app)!;
     f.Source.Version = "v2";
@@ -138,7 +149,7 @@ async Task Upgrade()
 
 async Task Offline()
 {
-    using var f = Make(); var app = AppSpec.All[0];
+    using var f = Make(); var app = Apps[0];
     await f.Manager.SetEnabledAsync(app, true);
     f.Processes.Running.Clear(); f.Source.Offline = true;
     await f.Manager.SynchronizeAllAsync();
@@ -147,7 +158,7 @@ async Task Offline()
 
 async Task FailedDownload()
 {
-    using var f = Make(); var app = AppSpec.All[0];
+    using var f = Make(); var app = Apps[0];
     await f.Manager.SetEnabledAsync(app, true);
     f.Source.Version = "v2"; f.Source.BrokenDownload = true;
     await f.Manager.SynchronizeAllAsync();
@@ -156,7 +167,7 @@ async Task FailedDownload()
 
 async Task Rollback()
 {
-    using var f = Make(); var app = AppSpec.All[0];
+    using var f = Make(); var app = Apps[0];
     await f.Manager.SetEnabledAsync(app, true);
     string previous = f.Store.ReadPackage(app)!.ExecutablePath;
     f.Source.Version = "v2"; f.Processes.FailNextStart = true;
@@ -166,7 +177,7 @@ async Task Rollback()
 
 async Task CancelDownload()
 {
-    using var f = Make(); var app = AppSpec.All[0];
+    using var f = Make(); var app = Apps[0];
     f.Source.Block = true;
     Task installation = f.Manager.SetEnabledAsync(app, true);
     await f.Source.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -179,7 +190,7 @@ async Task CancelDownload()
 
 async Task RapidToggle()
 {
-    using var f = Make(); var app = AppSpec.All[0];
+    using var f = Make(); var app = Apps[0];
     f.Source.Block = true;
     Task first = f.Manager.SetEnabledAsync(app, true);
     await f.Source.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -192,7 +203,7 @@ async Task RapidToggle()
 
 async Task Disable()
 {
-    using var f = Make(); var app = AppSpec.All[1];
+    using var f = Make(); var app = Apps[1];
     await f.Manager.SetEnabledAsync(app, true);
     await f.Manager.SetEnabledAsync(app, false);
     Assert(!f.Store.Load().IsEnabled(app) && f.Processes.Running.Count == 0 && f.Startup.Removed.Contains(app.Id), "Disable did not persist/stop/unregister.");
@@ -245,22 +256,135 @@ async Task ScopedProcesses()
 
 Task InvalidStoredPath()
 {
-    using var f = Make(); var app = AppSpec.All[0];
+    using var f = Make(); var app = Apps[0];
     string outside = Path.Combine(root, "outside.exe"); File.WriteAllText(outside, "MZ");
     f.Store.WritePackage(app, new("v1", "x", new string('a', 64), outside));
     Assert(f.Store.ReadPackage(app) is null, "Path outside application root was accepted.");
     return Task.CompletedTask;
 }
 
+async Task InvalidCatalog()
+{
+    string Entry(string id = "one", string name = "One", string repository = "https://github.com/example/one", string executable = "One.exe") =>
+        $$"""{"id":"{{id}}","name":"{{name}}","description":"d","repository":"{{repository}}","executable":"{{executable}}"}""";
+    string Document(params string[] entries) => $$"""{"schema":1,"utilities":[{{string.Join(",", entries)}}]}""";
+    Assert(Catalog.Parse(Document(Entry(), Entry("two", "Two", "https://github.com/example/two", "Two.exe"))).Count == 2, "A valid catalog was rejected.");
+    string[] invalid =
+    [
+        Document(Entry()).Replace("\"schema\":1", "\"schema\":2"),
+        Document(Entry(id: "Bad Id")),
+        Document(Entry(name: "")),
+        Document(Entry(repository: "https://evil.example/example/one")),
+        Document(Entry(repository: "http://github.com/example/one")),
+        Document(Entry(repository: "https://github.com/example/one/releases")),
+        Document(Entry(executable: "..\\\\One.exe")),
+        Document(Entry(executable: "One.dll")),
+        Document(Entry(), Entry(executable: "Other.exe")),
+        Document(Entry(), Entry(id: "two"))
+    ];
+    foreach (string json in invalid) await Reject(() => Task.FromResult(Catalog.Parse(json)));
+}
+
+async Task CatalogRefresh()
+{
+    var store = new StateStore(NewRoot());
+    store.SaveCatalog(Apps[..3]);
+    store.Save(new Preferences { Enabled = { ["one"] = true, ["two"] = false, ["three"] = false }, Known = ["one", "two", "three"] });
+    var catalog = new FakeCatalog([Apps[1], Apps[3]]);
+    using var manager = new Manager(store, new FakeSource(), catalog, new FakeProcesses(), new FakeStartup());
+    int notifications = 0;
+    manager.CatalogChanged += () => notifications++;
+    Assert(await manager.RefreshCatalogAsync() && notifications == 1, "The catalog change was not reported.");
+    Assert(string.Join(",", manager.Apps.Select(app => app.Id)) == "two,four,one", "Removed enabled utility was dropped, or a removed disabled one kept.");
+    Assert(manager.IsNew(Apps[3]) && !manager.IsNew(Apps[1]), "New utility detection failed.");
+    Assert(!await manager.RefreshCatalogAsync() && notifications == 1, "An unchanged catalog was reported as changed.");
+    using var reloaded = new Manager(store, new FakeSource(), new FakeCatalog([]), new FakeProcesses(), new FakeStartup());
+    Assert(reloaded.Apps.SequenceEqual(manager.Apps), "The refreshed catalog was not cached.");
+}
+
+async Task KnownUtilities()
+{
+    var fresh = new StateStore(NewRoot());
+    fresh.SaveCatalog(Apps);
+    using (var first = new Manager(fresh, new FakeSource(), new FakeCatalog(Apps), new FakeProcesses(), new FakeStartup()))
+        Assert(first.IsFirstRun && Apps.All(first.IsNew) && first.GetStatus(Apps[0]).Message == "Ready to install", "A first run must offer every utility.");
+
+    // Settings written before the dynamic catalog have Enabled entries for every applied utility.
+    var store = new StateStore(NewRoot());
+    store.SaveCatalog(Apps[..3]);
+    store.Save(new Preferences { Enabled = { ["one"] = true, ["two"] = false } });
+    using var manager = new Manager(store, new FakeSource(), new FakeCatalog(Apps[..3]), new FakeProcesses(), new FakeStartup());
+    Assert(!manager.IsFirstRun && !manager.IsNew(Apps[0]) && !manager.IsNew(Apps[1]) && manager.IsNew(Apps[2]), "Migration of applied utilities failed.");
+    Assert(manager.GetStatus(Apps[2]).Message.StartsWith("New"), "A new utility is not labelled as new.");
+    await manager.SetEnabledAsync(Apps[2], false);
+    using var reloaded = new Manager(store, new FakeSource(), new FakeCatalog(Apps[..3]), new FakeProcesses(), new FakeStartup());
+    Assert(!reloaded.IsNew(Apps[2]), "A utility the user decided on is still new.");
+}
+
+async Task CheckWithoutDownload()
+{
+    using var f = Make(); var app = Apps[0];
+    await f.Manager.SetEnabledAsync(app, true);
+    f.Source.Version = "v2";
+    await f.Manager.CheckAllAsync();
+    var status = f.Manager.GetStatus(app);
+    Assert(status.Message == "Update to v2 available" && status.Version == "v1", $"Update not reported: {status.Message}");
+    Assert(f.Manager.GetStatus(Apps[1]).Message == "v2 ready to install", "A not-installed utility does not show its latest version.");
+    Assert(f.Source.Downloads == 1 && f.Store.ReadPackage(app)!.Version == "v1", "Checking downloaded or installed an update.");
+    await f.Manager.SetEnabledAsync(app, true);
+    Assert(f.Store.ReadPackage(app)!.Version == "v2", "Applying did not install the update.");
+}
+
+async Task OfflineCatalog()
+{
+    using var f = Make();
+    f.Catalog.Offline = true;
+    try { await f.Manager.CheckAllAsync(); throw new Exception("An unavailable catalog was not reported."); }
+    catch (InvalidOperationException) { }
+    Assert(f.Manager.Apps.Count == Apps.Length && f.Source.Resolutions == Apps.Length, "The cached utilities were not checked offline.");
+
+    var empty = new StateStore(NewRoot());
+    using var manager = new Manager(empty, new FakeSource(), new FakeCatalog(Apps) { Offline = true }, new FakeProcesses(), new FakeStartup());
+    try { await manager.CheckAllAsync(); throw new Exception("A missing catalog was not reported."); }
+    catch (InvalidOperationException) { }
+    Assert(manager.Apps.Count == 0, "Utilities appeared without a catalog.");
+}
+
+async Task BackgroundIgnoresNew()
+{
+    var store = new StateStore(NewRoot());
+    store.SaveCatalog(Apps[..2]);
+    store.Save(new Preferences { Enabled = { ["one"] = false }, Known = ["one"] });
+    var startup = new FakeStartup();
+    using var manager = new Manager(store, new FakeSource(), new FakeCatalog(Apps[..2]), new FakeProcesses(), startup);
+    await manager.SynchronizeAllAsync();
+    Assert(startup.Removed.Contains("one") && !startup.Removed.Contains("two"), "A never-offered utility's own startup entry was touched.");
+}
+
 sealed class Fixture : IDisposable
 {
     public StateStore Store { get; }
     public FakeSource Source { get; } = new();
+    public FakeCatalog Catalog { get; }
     public FakeProcesses Processes { get; } = new();
     public FakeStartup Startup { get; } = new();
     public Manager Manager { get; }
-    public Fixture(string root) { Store = new(root); Manager = new(Store, Source, Processes, Startup); }
+    public Fixture(string root, AppSpec[] apps)
+    {
+        Store = new(root);
+        Store.SaveCatalog(apps);
+        Catalog = new(apps);
+        Manager = new(Store, Source, Catalog, Processes, Startup);
+    }
     public void Dispose() => Manager.Dispose();
+}
+
+sealed class FakeCatalog(IEnumerable<AppSpec> apps) : ICatalogSource
+{
+    public AppSpec[] Apps { get; set; } = apps.ToArray();
+    public bool Offline { get; set; }
+    public Task<string> FetchCatalogAsync(CancellationToken token) =>
+        Offline ? throw new HttpRequestException("Network unavailable") : Task.FromResult(WinKit.Catalog.Serialize(Apps));
 }
 
 sealed class FakeSource : IReleaseSource

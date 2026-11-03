@@ -15,16 +15,31 @@ internal interface IReleaseSource
     Task DownloadAsync(ReleaseAsset asset, string destination, IProgress<int> progress, CancellationToken cancellationToken);
 }
 
-internal sealed class GitHubReleases : IReleaseSource, IDisposable
+internal sealed class GitHubReleases : IReleaseSource, ICatalogSource, IDisposable
 {
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromMinutes(10) };
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
     public GitHubReleases()
     {
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("WinKit/0.2");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd("WinKit/0.4");
         _http.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
     }
 
+    public async Task<string> FetchCatalogAsync(CancellationToken cancellationToken)
+    {
+        string location = Catalog.Location;
+        if (!location.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            return await File.ReadAllTextAsync(location, cancellationToken);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(30));
+        // Bypass intermediate caches so a newly added utility shows up on the next refresh.
+        using var request = new HttpRequestMessage(HttpMethod.Get, location);
+        request.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true };
+        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength > Catalog.MaximumBytes) throw new InvalidDataException("The catalog is too large.");
+        return await response.Content.ReadAsStringAsync(timeout.Token);
+    }
     public async Task<ManagedRelease> ResolveAsync(AppSpec app, CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

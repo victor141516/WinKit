@@ -6,20 +6,17 @@ namespace WinKit;
 internal sealed record AppSpec(string Id, string Name, string Description, string RepositoryUrl, string Executable)
 {
     public string LatestReleaseUrl => RepositoryUrl.Replace("https://github.com/", "https://api.github.com/repos/", StringComparison.Ordinal) + "/releases/latest";
-    public static readonly AppSpec[] All =
-    [
-        new("comienzo", "Comienzo", "A faster Start menu", "https://github.com/victor141516/comienzo", "Comienzo.exe"),
-        new("voolime", "Voolime", "Volume controls for each app", "https://github.com/victor141516/voolime", "Voolime.exe"),
-        new("trapezoid", "Trapezoid", "Arrange windows with shortcuts", "https://github.com/victor141516/trapezoid", "Trapezoid.exe"),
-        new("captura", "Captura", "Capture and annotate screenshots", "https://github.com/victor141516/Captura", "Captura.exe"),
-        new("altabi", "Altabi", "Alt+Tab grouped by app", "https://github.com/victor141516/altabi", "Altabi.exe")
-    ];
 }
 
 internal sealed class Preferences
 {
     public Dictionary<string, bool> Enabled { get; set; } = new();
     public bool StartWithWindows { get; set; } = true;
+    /// <summary>
+    /// Utilities the user has already been offered. Catalog entries outside this list are new
+    /// and preselected. Null in settings written before the catalog became dynamic.
+    /// </summary>
+    public List<string>? Known { get; set; }
     public bool IsEnabled(AppSpec app) => Enabled.GetValueOrDefault(app.Id);
 }
 
@@ -36,6 +33,21 @@ internal sealed class StateStore(string root)
         ? JsonSerializer.Deserialize<Preferences>(File.ReadAllText(SettingsPath)) ?? throw new InvalidDataException("The settings file is empty.")
         : new Preferences();
     public void Save(Preferences preferences) => WriteJson(SettingsPath, preferences);
+    public string CatalogPath => Path.Combine(Root, "catalog.json");
+    /// <summary>The last catalog WinKit worked with; used at startup and while offline.</summary>
+    public IReadOnlyList<AppSpec> LoadCatalog()
+    {
+        if (!File.Exists(CatalogPath)) return [];
+        try { return Catalog.Parse(File.ReadAllText(CatalogPath)); }
+        catch (Exception ex) when (ex is InvalidDataException or JsonException or IOException) { Log.Error("Cached catalog", ex); return []; }
+    }
+    public void SaveCatalog(IReadOnlyList<AppSpec> apps)
+    {
+        Directory.CreateDirectory(Root);
+        string temp = CatalogPath + ".new";
+        File.WriteAllText(temp, Catalog.Serialize(apps));
+        File.Move(temp, CatalogPath, true);
+    }
     public string AppRoot(AppSpec app) => Path.Combine(Root, "apps", app.Id);
     public string PackagePath(AppSpec app) => Path.Combine(AppRoot(app), "installed.json");
     public InstalledPackage? ReadPackage(AppSpec app)

@@ -5,8 +5,10 @@ is the user's Codex skills directory; the deliverable copy sits beside this sour
 
 WinKit uses C#/.NET 10, WPF Fluent, and a native Windows tray menu. Keep background
 startup silent and enforce one instance before creating UI or tray resources.
-The catalog's repository URLs are fixed; release versions and portable packages are
-resolved from each latest stable GitHub release and its `winkit.json` manifest.
+The list of utilities is data: `catalog.json` on the default branch, downloaded at every refresh
+and cached in `%LOCALAPPDATA%\WinKit\catalog.json`. Never hardcode utilities in code. Release
+versions and portable packages are resolved from each latest stable GitHub release and its
+`winkit.json` manifest.
 
 Maintain per-utility cancellation and activation serialization. Never restart a
 disabled utility. Keep process termination scoped to managed paths and preserve
@@ -74,14 +76,31 @@ utilities (C++) must produce the same files themselves.
 }
 ```
 
-To add the utility to WinKit:
+To add the utility to WinKit, append an entry to `catalog.json` and push it to the default
+branch. No WinKit release is needed: every WinKit picks it up the next time its window opens or
+its refresh button is pressed, shows it as new and preselected, and installs it on
+**Apply selection**. Background startup never installs or touches a utility the user has not
+been offered.
 
-1. Append an `AppSpec(id, Name, Description, RepositoryUrl, Executable)` to `AppSpec.All` in
-   `Models.cs`. Keep the order: new utilities go last, because tests and existing settings rely
-   on the earlier entries. Existing installations get the new utility disabled.
-2. Run the Release build and the unit tests, then
-   `dotnet run --project Tests/WinKit.Tests.csproj -c Release -- --verify-live` to download and
-   verify every catalog release without starting anything.
-3. Render `WinKit.exe --preview <path.png>` and check that the list still fits.
-4. Mention the utility in the README introduction and tray description, bump `<Version>` in
-   `WinKit.csproj`, and publish a new WinKit build: the catalog is compiled into the manager.
+```json
+{
+  "id": "app",
+  "name": "App",
+  "description": "Up to 80 characters",
+  "repository": "https://github.com/<owner>/<repository>",
+  "executable": "App.exe"
+}
+```
+
+`Catalog.Parse` rejects the whole catalog if any entry is invalid (lowercase `id` of letters,
+digits and dashes; unique `id` and `executable`; `https://github.com/<owner>/<repository>`), so
+check it before pushing:
+
+```powershell
+$env:WINKIT_CATALOG = "$PWD\catalog.json"   # local file instead of the published catalog
+dotnet run --project Tests/WinKit.Tests.csproj -c Release -- --verify-live
+dotnet run --project Tests/WinKit.Tests.csproj -c Release
+```
+
+`--verify-live` downloads and verifies every catalog release without starting anything. Also add
+the utility to the table in `README.md`.

@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "utilities": [
+    {
+      "id": "comienzo",
+      "name": "Comienzo",
+      "description": "A faster Start menu",
+      "repository": "https://github.com/victor141516/comienzo",
+      "executable": "Comienzo.exe"
+    },
+    {
+      "id": "voolime",
+      "name": "Voolime",
+      "description": "Volume controls for each app",
+      "repository": "https://github.com/victor141516/voolime",
+      "executable": "Voolime.exe"
+    },
+    {
+      "id": "trapezoid",
+      "name": "Trapezoid",
+      "description": "Arrange windows with shortcuts",
+      "repository": "https://github.com/victor141516/trapezoid",
+      "executable": "Trapezoid.exe"
+    },
+    {
+      "id": "captura",
+      "name": "Captura",
+      "description": "Capture and annotate screenshots",
+      "repository": "https://github.com/victor141516/Captura",
+      "executable": "Captura.exe"
+    },
+    {
+      "id": "altabi",
+      "name": "Altabi",
+      "description": "Alt+Tab grouped by app",
+      "repository": "https://github.com/victor141516/altabi",
+      "executable": "Altabi.exe"
+    }
+  ]
+}

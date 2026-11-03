@@ -4,26 +4,134 @@ internal sealed class Manager : IDisposable
 {
     private readonly StateStore _store;
     private readonly IReleaseSource _releases;
+    private readonly ICatalogSource _catalog;
     private readonly IProcessControl _processes;
     private readonly IStartupControl _startup;
     private readonly object _settingsLock = new();
     private readonly Preferences _preferences;
-    private readonly Dictionary<string, Slot> _slots = AppSpec.All.ToDictionary(app => app.Id, _ => new Slot());
-    private bool _disposed;
+    private readonly object _slotsLock = new();
+    private readonly Dictionary<string, Slot> _slots = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _appsLock = new();
+    private readonly SemaphoreSlim _catalogRefresh = new(1, 1);
+    private readonly bool _hadSettings;
+    private IReadOnlyList<AppSpec> _apps;
+    private volatile bool _disposed;
     public event Action<AppSpec, AppStatus>? StatusChanged;
+    /// <summary>Raised (on a worker thread) when the list of utilities changes.</summary>
+    public event Action? CatalogChanged;
     public StateStore Store => _store;
-    public bool HasSelection => AppSpec.All.Any(IsEnabled);
+    /// <summary>The utilities from the last loaded catalog, in catalog order.</summary>
+    public IReadOnlyList<AppSpec> Apps { get { lock (_appsLock) return _apps; } }
+    /// <summary>True when WinKit had no settings at startup: every utility is offered for the first time.</summary>
+    public bool IsFirstRun => !_hadSettings;
+    public bool HasSelection => Apps.Any(IsEnabled);
     public bool StartWithWindows { get { lock (_settingsLock) return _preferences.StartWithWindows; } }
     public bool IsEnabled(AppSpec app) { lock (_settingsLock) return _preferences.IsEnabled(app); }
+    /// <summary>A utility the user has not been offered yet; it is preselected in the window.</summary>
+    public bool IsNew(AppSpec app) { lock (_settingsLock) return !_preferences.Known!.Contains(app.Id, StringComparer.OrdinalIgnoreCase); }
 
-    public Manager(StateStore store, IReleaseSource releases, IProcessControl processes, IStartupControl startup)
+    public Manager(StateStore store, IReleaseSource releases, ICatalogSource catalog, IProcessControl processes, IStartupControl startup)
     {
-        _store = store; _releases = releases; _processes = processes; _startup = startup;
+        _store = store; _releases = releases; _catalog = catalog; _processes = processes; _startup = startup;
+        _hadSettings = store.Exists;
         _preferences = store.Load();
-        foreach (var app in AppSpec.All) _slots[app.Id].Status = new AppStatus(IsEnabled(app), IsEnabled(app) ? "Ready to check for updates" : "Disabled");
+        if (_preferences.Known is null)
+        {
+            // Settings from versions with a built-in list: every utility the user applied was offered.
+            _preferences.Known = _preferences.Enabled.Keys.ToList();
+            if (_hadSettings) store.Save(_preferences);
+        }
+        _apps = store.LoadCatalog();
     }
 
-    public AppStatus GetStatus(AppSpec app) { lock (_slots[app.Id].Gate) return _slots[app.Id].Status; }
+    public AppStatus GetStatus(AppSpec app) { var slot = GetSlot(app); lock (slot.Gate) return slot.Status; }
+
+    private Slot GetSlot(AppSpec app)
+    {
+        lock (_slotsLock)
+        {
+            if (_slots.TryGetValue(app.Id, out var slot)) return slot;
+            slot = new Slot { Status = InitialStatus(app) };
+            _slots.Add(app.Id, slot);
+            return slot;
+        }
+    }
+
+    private AppStatus InitialStatus(AppSpec app) =>
+        IsEnabled(app) ? new AppStatus(true, "Ready to check for updates")
+        : !IsNew(app) ? new AppStatus(false, "Disabled")
+        : new AppStatus(false, IsFirstRun ? "Ready to install" : "New · ready to install");
+
+    /// <summary>
+    /// Downloads the catalog and replaces the utility list. Utilities removed from the catalog stay
+    /// while enabled. Returns whether the list changed; throws when the catalog is unavailable.
+    /// </summary>
+    public async Task<bool> RefreshCatalogAsync(CancellationToken cancellationToken = default)
+    {
+        await _catalogRefresh.WaitAsync(cancellationToken);
+        try
+        {
+            var remote = Catalog.Parse(await _catalog.FetchCatalogAsync(cancellationToken));
+            IReadOnlyList<AppSpec> merged;
+            lock (_appsLock)
+            {
+                merged = Catalog.Merge(remote, _apps, IsEnabled);
+                if (merged.SequenceEqual(_apps)) return false;
+                _apps = merged;
+            }
+            _store.SaveCatalog(merged);
+            CatalogChanged?.Invoke();
+            return true;
+        }
+        finally { _catalogRefresh.Release(); }
+    }
+
+    /// <summary>
+    /// Refreshes the catalog and checks every utility's latest release without downloading it, so
+    /// the window can show new utilities and available updates. Applying the selection installs them.
+    /// </summary>
+    public async Task CheckAllAsync(CancellationToken cancellationToken = default)
+    {
+        Exception? catalogError = null;
+        try { await RefreshCatalogAsync(cancellationToken); }
+        catch (Exception ex) when (ex is not OperationCanceledException) { catalogError = ex; Log.Error("Catalog", ex); }
+        var apps = Apps;
+        if (apps.Count == 0 && catalogError is not null)
+            throw new InvalidOperationException("The list of utilities could not be downloaded. " + catalogError.Message, catalogError);
+        await Task.WhenAll(apps.Select(app => CheckAsync(app, cancellationToken)));
+        if (catalogError is not null)
+            throw new InvalidOperationException("The list of utilities could not be refreshed. " + catalogError.Message, catalogError);
+    }
+
+    private async Task CheckAsync(AppSpec app, CancellationToken cancellationToken)
+    {
+        var slot = GetSlot(app);
+        // An install or update in progress reports its own status.
+        if (!await slot.UpdateLock.WaitAsync(0, cancellationToken)) return;
+        try
+        {
+            var installed = _store.ReadPackage(app);
+            bool enabled = IsEnabled(app);
+            ManagedRelease release;
+            try { release = await _releases.ResolveAsync(app, cancellationToken); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Log.Error(app.Name, ex);
+                Publish(app, new AppStatus(enabled, "Could not check for updates · " + ex.Message, true, installed?.Version));
+                return;
+            }
+            bool current = installed is not null && installed.Version == release.Version &&
+                           installed.Sha256.Equals(release.Sha256, StringComparison.OrdinalIgnoreCase);
+            AppStatus status = enabled
+                ? installed is null ? new AppStatus(true, $"{release.Version} ready to install")
+                : current ? new AppStatus(true, _processes.IsRunning(app, _store.AppRoot(app)) ? "Running · up to date" : "Up to date", Version: installed.Version)
+                : new AppStatus(true, $"Update to {release.Version} available", Version: installed.Version)
+                : !IsNew(app) ? new AppStatus(false, $"Disabled · latest {release.Version}")
+                : new AppStatus(false, IsFirstRun ? $"{release.Version} ready to install" : $"New · {release.Version} ready to install");
+            Publish(app, status);
+        }
+        finally { slot.UpdateLock.Release(); }
+    }
     public void SetStartWithWindows(bool enabled)
     {
         lock (_settingsLock)
@@ -36,7 +144,7 @@ internal sealed class Manager : IDisposable
 
     public async Task SetEnabledAsync(AppSpec app, bool enabled)
     {
-        var slot = _slots[app.Id];
+        var slot = GetSlot(app);
         // Cancel before waiting for the slot; a blocked HTTP request must not defer disable.
         lock (slot.Gate)
         {
@@ -44,6 +152,9 @@ internal sealed class Manager : IDisposable
             lock (_settingsLock)
             {
                 _preferences.Enabled[app.Id] = enabled;
+                // Choosing either way means the utility has been offered; it is no longer new.
+                var known = _preferences.Known!;
+                if (!known.Contains(app.Id, StringComparer.OrdinalIgnoreCase)) known.Add(app.Id);
                 _store.Save(_preferences);
                 _startup.SetManagerEnabled(_preferences.StartWithWindows);
             }
@@ -63,8 +174,12 @@ internal sealed class Manager : IDisposable
 
     public async Task SynchronizeAllAsync()
     {
+        try { await RefreshCatalogAsync(); }
+        catch (Exception ex) { Log.Error("Catalog", ex); }
         lock (_settingsLock) _startup.SetManagerEnabled(_preferences.StartWithWindows);
-        await Task.WhenAll(AppSpec.All.Select(app => IsEnabled(app) ? SynchronizeAsync(app) : DisableAtStartupAsync(app)));
+        // Utilities never offered to the user are left alone: their own startup entries are not WinKit's.
+        await Task.WhenAll(Apps.Where(app => IsEnabled(app) || !IsNew(app))
+            .Select(app => IsEnabled(app) ? SynchronizeAsync(app) : DisableAtStartupAsync(app)));
     }
 
     private Task DisableAtStartupAsync(AppSpec app)
@@ -80,7 +195,7 @@ internal sealed class Manager : IDisposable
 
     public async Task SynchronizeAsync(AppSpec app)
     {
-        var slot = _slots[app.Id];
+        var slot = GetSlot(app);
         CancellationTokenSource cancellation;
         lock (slot.Gate)
         {
@@ -172,7 +287,7 @@ internal sealed class Manager : IDisposable
 
     private void StartIfEnabled(AppSpec app, InstalledPackage package, CancellationTokenSource cancellation, string message)
     {
-        var slot = _slots[app.Id];
+        var slot = GetSlot(app);
         lock (slot.Gate)
         {
             cancellation.Token.ThrowIfCancellationRequested();
@@ -194,18 +309,22 @@ internal sealed class Manager : IDisposable
 
     private void Publish(AppSpec app, AppStatus status)
     {
-        lock (_slots[app.Id].Gate)
+        var slot = GetSlot(app);
+        lock (slot.Gate)
         {
             if (_disposed || status.Enabled != IsEnabled(app)) return;
-            _slots[app.Id].Status = status;
+            slot.Status = status;
             StatusChanged?.Invoke(app, status);
         }
     }
     public void Dispose()
     {
-        foreach (var slot in _slots.Values)
+        Slot[] slots;
+        lock (_slotsLock) slots = _slots.Values.ToArray();
+        _disposed = true;
+        foreach (var slot in slots)
         {
-            lock (slot.Gate) { _disposed = true; slot.Cancellation?.Cancel(); }
+            lock (slot.Gate) slot.Cancellation?.Cancel();
         }
     }
     private sealed class Slot

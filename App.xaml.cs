@@ -23,6 +23,7 @@ public partial class App : System.Windows.Application
     private Icon? _icon;
     private readonly Dictionary<string, Forms.ToolStripMenuItem> _utilityItems = new();
     private Forms.ToolStripMenuItem? _startupItem;
+    private Forms.ToolStripSeparator? _utilitiesEnd;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -60,7 +61,7 @@ public partial class App : System.Windows.Application
             var store = new StateStore(Bootstrap.Root);
             bool firstRun = !store.Exists;
             _releases = new GitHubReleases();
-            _manager = new Manager(store, _releases, new ProcessControl(), new StartupControl(Environment.ProcessPath!));
+            _manager = new Manager(store, _releases, _releases, new ProcessControl(), new StartupControl(Environment.ProcessPath!));
             _show = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\WinKit.Manager.Show");
             _showRegistration = ThreadPool.RegisterWaitForSingleObject(_show, (_, _) => Dispatcher.BeginInvoke(new Action(ShowSettings)), null, Timeout.Infinite, false);
             CreateTray();
@@ -69,7 +70,12 @@ public partial class App : System.Windows.Application
                 _window?.Update(app, status);
                 RefreshTray();
             });
-            if (!background) ShowSettings(firstRun);
+            _manager.CatalogChanged += () => Dispatcher.BeginInvoke(() =>
+            {
+                RebuildUtilityItems();
+                _window?.SyncRows();
+            });
+            if (!background) ShowSettings();
             if (!firstRun) _ = RunManagerActionAsync(_manager.SynchronizeAllAsync, showErrors: false);
         }
         catch (Exception ex)
@@ -90,26 +96,8 @@ public partial class App : System.Windows.Application
         menu.Opening += (_, _) => RefreshTray();
         menu.Items.Add("Open WinKit", null, (_, _) => ShowSettings());
         menu.Items.Add(new Forms.ToolStripSeparator());
-        foreach (var app in AppSpec.All)
-        {
-            var status = _manager.GetStatus(app);
-            var item = new Forms.ToolStripMenuItem(app.Name)
-            {
-                Checked = _manager.IsEnabled(app),
-                ToolTipText = status.Message,
-                CheckOnClick = false
-            };
-            _utilityItems[app.Id] = item;
-            item.Click += async (_, _) =>
-            {
-                bool enabled = !_manager.IsEnabled(app);
-                await RunManagerActionAsync(() => _manager.SetEnabledAsync(app, enabled));
-                _window?.RefreshSelection();
-                RefreshTray();
-            };
-            menu.Items.Add(item);
-        }
-        menu.Items.Add(new Forms.ToolStripSeparator());
+        _utilitiesEnd = new Forms.ToolStripSeparator();
+        menu.Items.Add(_utilitiesEnd);
         menu.Items.Add("Check for updates", null, async (_, _) => await RunManagerActionAsync(_manager.SynchronizeAllAsync));
         var startup = new Forms.ToolStripMenuItem("Start with Windows") { Checked = _manager.StartWithWindows };
         _startupItem = startup;
@@ -121,13 +109,36 @@ public partial class App : System.Windows.Application
         menu.Items.Add(startup);
         menu.Items.Add("Exit WinKit", null, (_, _) => ExitManager());
         _tray.ContextMenuStrip = menu;
+        RebuildUtilityItems();
+    }
+
+    /// <summary>Recreates one tray toggle per catalog utility, above the utilities separator.</summary>
+    private void RebuildUtilityItems()
+    {
+        if (_manager is null || _tray?.ContextMenuStrip is not { } menu || _utilitiesEnd is null || _exiting) return;
+        foreach (var old in _utilityItems.Values) { menu.Items.Remove(old); old.Dispose(); }
+        _utilityItems.Clear();
+        int index = menu.Items.IndexOf(_utilitiesEnd);
+        foreach (var app in _manager.Apps)
+        {
+            var item = new Forms.ToolStripMenuItem(app.Name) { CheckOnClick = false };
+            item.Click += async (_, _) =>
+            {
+                bool enabled = !_manager.IsEnabled(app);
+                await RunManagerActionAsync(() => _manager.SetEnabledAsync(app, enabled));
+                _window?.RefreshSelection();
+                RefreshTray();
+            };
+            _utilityItems[app.Id] = item;
+            menu.Items.Insert(index++, item);
+        }
         RefreshTray();
     }
 
     private void RefreshTray()
     {
         if (_manager is null || _exiting) return;
-        foreach (var app in AppSpec.All)
+        foreach (var app in _manager.Apps)
         {
             if (!_utilityItems.TryGetValue(app.Id, out var item)) continue;
             item.Checked = _manager.IsEnabled(app);
@@ -147,20 +158,26 @@ public partial class App : System.Windows.Application
         }
     }
 
-    private void ShowSettings() => ShowSettings(false);
-    private void ShowSettings(bool firstRun)
+    /// <summary>Shows the window and checks for new utilities and updates every time it opens.</summary>
+    private void ShowSettings()
     {
         if (_manager is null) return;
         if (_window is null)
         {
-            _window = new MainWindow(_manager, firstRun);
+            _window = new MainWindow(_manager);
             _window.Closing += (_, args) => { if (!_exiting) { args.Cancel = true; _window.Hide(); } };
         }
-        else if (!firstRun) _window.RefreshSelection();
-        if (!firstRun) foreach (var app in AppSpec.All) _window.Update(app, _manager.GetStatus(app));
+        else if (!_window.IsVisible)
+        {
+            _window.SyncRows();
+            _window.RefreshSelection();
+            foreach (var app in _manager.Apps) _window.Update(app, _manager.GetStatus(app));
+        }
+        bool opening = !_window.IsVisible;
         _window.Show();
         _window.WindowState = WindowState.Normal;
         _window.Activate();
+        if (opening) _ = _window.RefreshAsync();
     }
 
     private void ExitManager() { _exiting = true; _manager?.Dispose(); _window?.Close(); Shutdown(); }
@@ -199,14 +216,17 @@ public partial class App : System.Windows.Application
         string root = Path.Combine(Path.GetTempPath(), "WinKitPreview-" + Guid.NewGuid().ToString("N"));
         try
         {
-            using var manager = new Manager(new StateStore(root), new GitHubReleases(), new PreviewProcesses(), new PreviewStartup());
-            var window = new MainWindow(manager, true);
+            using var releases = new GitHubReleases();
+            using var manager = new Manager(new StateStore(root), releases, releases, new PreviewProcesses(), new PreviewStartup());
+            var window = new MainWindow(manager);
             window.ShowInTaskbar = false;
             window.ShowActivated = false;
             window.Left = -10000;
             window.Top = -10000;
             window.WindowStartupLocation = WindowStartupLocation.Manual;
             window.Show();
+            // The preview shows what a first launch shows: the downloaded catalog and latest versions.
+            await window.RefreshAsync();
             await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
             await Task.Delay(300);
             window.UpdateLayout();
